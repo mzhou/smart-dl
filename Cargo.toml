@@ -1,6 +1,11 @@
 [package]
+edition = "2021"
 name = "smart-dl"
 version = "0.1.0"
-edition = "2021"
 
 [dependencies]
+clap = { features = ["derive"], version = "4.5" }
+generic-array = { version = "1.0" }
+memmap2 = { version = "0.9" }
+reqwest = { version = "0.12" }
+tokio = { features = ["macros", "rt-multi-thread"], version = "1.38" }
