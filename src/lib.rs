@@ -116,9 +116,9 @@ where
     pool.push_back(head_resources);
 
     let file_chunks = (content_length + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    println!("{} chunks", file_chunks);
     let mut tasks = JoinSet::<Result<TaskReturn, TaskError>>::new();
     for chunk_i in 0..file_chunks {
-        eprintln!("chunk {} getting resources", chunk_i);
         let resources = if let Some(r) = pool.pop_front() {
             Ok::<_, MainError>(r)
         } else {
@@ -131,7 +131,6 @@ where
                 Ok(make_resources()?)
             }
         }?;
-        eprintln!("chunk {} got resources", chunk_i);
 
         let range_begin = chunk_i * CHUNK_SIZE;
         let range_end = min(content_length, (chunk_i + 1u64) * CHUNK_SIZE);
@@ -192,6 +191,10 @@ where
             }
             Ok(TaskReturn { resources })
         });
+    }
+
+    while let Some(task_return_join_result) = tasks.join_next().await {
+        task_return_join_result??;
     }
 
     Ok(0)
