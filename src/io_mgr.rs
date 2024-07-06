@@ -2,7 +2,8 @@ use std::fs::OpenOptions;
 use std::io::{Result as IoResult, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use memmap2::{MmapMut, MmapOptions};
+pub use memmap2::MmapMut;
+use memmap2::MmapOptions;
 
 pub fn create_mmap<P: AsRef<Path>>(
     path: P,

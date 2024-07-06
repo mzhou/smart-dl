@@ -5,15 +5,28 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::io::Error as IoError;
+use std::fs::File;
+use std::io::{Error as IoError, Write};
 use std::time::Duration;
 
 use clap::Parser;
 use reqwest::header::{CONTENT_LENGTH, RANGE};
 use reqwest::{Client, Error as ReqwestError};
-use tokio::task::JoinSet;
+use tokio::sync::mpsc::error::SendError;
+use tokio::sync::mpsc::{channel, Sender};
+use tokio::task::{spawn_blocking, JoinHandle, JoinSet};
 
-use io_mgr::create_mmap;
+use io_mgr::{create_mmap, MmapMut};
+
+struct LinearJob {
+    buf: MmapMut,
+    offset: usize,
+}
+
+#[derive(Debug)]
+enum LinearError {
+    Io(IoError),
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum MainError {
@@ -24,6 +37,8 @@ enum MainError {
 struct Opts {
     #[arg(long, default_value = "64")]
     connections: usize,
+    #[arg(long, required = false)]
+    linear: Option<String>,
     #[arg(long)]
     output: String,
     #[arg(long)]
@@ -35,6 +50,7 @@ enum TaskError {
     CloneReq,
     Io(IoError),
     Reqwest(ReqwestError),
+    Send(SendError<LinearJob>),
 }
 
 struct TaskReturn {
@@ -43,8 +59,24 @@ struct TaskReturn {
 
 struct TaskResources {
     client: Client,
+    linear_sender: Option<Sender<LinearJob>>,
     output: String,
     url: String,
+}
+
+impl Display for LinearError {
+    fn fmt(self: &Self, f: &mut Formatter) -> FmtResult {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl Error for LinearError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        use LinearError::*;
+        match self {
+            Io(e) => e.source(),
+        }
+    }
 }
 
 impl Display for TaskError {
@@ -60,6 +92,7 @@ impl Error for TaskError {
             CloneReq => None,
             Io(e) => e.source(),
             Reqwest(e) => e.source(),
+            Send(e) => e.source(),
         }
     }
 }
@@ -87,11 +120,47 @@ where
 {
     let opts = Opts::parse_from(itr);
 
+    let (linear_sender, mut linear_receiver) = channel::<LinearJob>(1);
+    let mut linear_task = Option::<JoinHandle<Result<(), LinearError>>>::None;
+
+    if let Some(linear) = opts.linear {
+        let mut linear_file = File::create(linear)?;
+        linear_task = Some(spawn_blocking(move || {
+            let mut next_offset = 0;
+            let mut queue = VecDeque::<LinearJob>::new();
+            while let Some(job) = linear_receiver.blocking_recv() {
+                if job.offset == next_offset {
+                    linear_file.write_all(&job.buf).map_err(LinearError::Io)?;
+                    next_offset += job.buf.len();
+                } else {
+                    queue.push_back(job);
+                    queue.make_contiguous().sort_by_key(|j| j.offset);
+                }
+                while let Some(queued_job) = queue.pop_front() {
+                    if queued_job.offset != next_offset {
+                        queue.push_front(queued_job);
+                        break;
+                    }
+                    linear_file
+                        .write_all(&queued_job.buf)
+                        .map_err(LinearError::Io)?;
+                    next_offset += queued_job.buf.len();
+                }
+            }
+            Ok::<_, LinearError>(())
+        }));
+    }
+
     let mut pool = VecDeque::<TaskResources>::new();
 
     let make_resources = || -> Result<TaskResources, ReqwestError> {
         Ok(TaskResources {
             client: build_client()?,
+            linear_sender: if linear_task.is_some() {
+                Some(linear_sender.clone())
+            } else {
+                None
+            },
             output: opts.output.clone(),
             url: opts.url.clone(),
         })
@@ -116,7 +185,7 @@ where
     pool.push_back(head_resources);
 
     let file_chunks = (content_length + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    println!("{} chunks", file_chunks);
+    eprintln!("{} chunks", file_chunks);
     let mut tasks = JoinSet::<Result<TaskReturn, TaskError>>::new();
     for chunk_i in 0..file_chunks {
         let resources = if let Some(r) = pool.pop_front() {
@@ -189,12 +258,27 @@ where
                     }
                 }
             }
+            if let Some(linear_sender) = &resources.linear_sender {
+                linear_sender
+                    .send(LinearJob {
+                        buf: mapping,
+                        offset: range_begin as usize,
+                    })
+                    .await
+                    .map_err(TaskError::Send)?;
+            }
             Ok(TaskReturn { resources })
         });
     }
 
     while let Some(task_return_join_result) = tasks.join_next().await {
         task_return_join_result??;
+    }
+
+    drop(linear_sender);
+
+    if let Some(lt) = linear_task {
+        lt.await??;
     }
 
     Ok(0)
