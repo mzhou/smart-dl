@@ -48,6 +48,8 @@ pub enum MainError {
 
 #[derive(Parser)]
 struct Opts {
+    #[arg(long, default_value = "16777216")]
+    chunk_size: u64,
     #[arg(long, default_value = "64")]
     connections: usize,
     #[arg(long, required = false)]
@@ -120,7 +122,6 @@ impl Error for TaskError {
     }
 }
 
-const CHUNK_SIZE: u64 = 16 * 1024 * 1024;
 const RETRY_WAIT_BASE: Duration = Duration::new(0, 100_000_000); // 0.1 seconds
 
 fn build_client() -> Result<Client, ReqwestError> {
@@ -223,7 +224,7 @@ where
 
     pool.push_back(head_resources);
 
-    let file_chunks = (content_length + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    let file_chunks = (content_length + opts.chunk_size - 1) / opts.chunk_size;
     eprintln!("{} chunks", file_chunks);
     let mut tasks = JoinSet::<Result<TaskReturn, TaskError>>::new();
     for chunk_i in 0..file_chunks {
@@ -240,8 +241,8 @@ where
             }
         }?;
 
-        let range_begin = chunk_i * CHUNK_SIZE;
-        let range_end = min(content_length, (chunk_i + 1u64) * CHUNK_SIZE);
+        let range_begin = chunk_i * opts.chunk_size;
+        let range_end = min(content_length, (chunk_i + 1u64) * opts.chunk_size);
         let range_size = range_end - range_begin;
         let range_str = format!("bytes={}-{}", range_begin, range_end - 1);
         let req = resources
