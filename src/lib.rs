@@ -7,30 +7,43 @@ use std::ffi::OsString;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::fs::File;
 use std::io::{Error as IoError, Write};
+use std::num::ParseIntError;
 use std::time::Duration;
 
 use clap::Parser;
-use reqwest::header::{CONTENT_LENGTH, RANGE};
+use percent_encoding::percent_decode_str;
+use reqwest::header::{ToStrError, CONTENT_LENGTH, RANGE};
 use reqwest::{Client, Error as ReqwestError};
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{channel, Sender};
-use tokio::task::{spawn_blocking, JoinHandle, JoinSet};
+use tokio::task::{spawn_blocking, JoinError, JoinHandle, JoinSet};
+use url::{ParseError, Url};
 
 use io_mgr::{create_mmap, MmapMut};
 
-struct LinearJob {
+pub struct LinearJob {
     buf: MmapMut,
     offset: usize,
 }
 
 #[derive(Debug)]
-enum LinearError {
+pub enum LinearError {
     Io(IoError),
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum MainError {
+#[derive(Debug)]
+pub enum MainError {
+    Io(IoError),
+    Join(JoinError),
+    Linear(LinearError),
     MissingContentLength,
+    OutputAlreadyExists,
+    OutputFromUrl,
+    Parse(ParseError),
+    ParseInt(ParseIntError),
+    Reqwest(ReqwestError),
+    Task(TaskError),
+    ToStr(ToStrError),
 }
 
 #[derive(Parser)]
@@ -39,14 +52,16 @@ struct Opts {
     connections: usize,
     #[arg(long, required = false)]
     linear: Option<String>,
-    #[arg(long)]
+    #[arg(default_value = "", long)]
     output: String,
+    #[arg(long)]
+    output_from_url: bool,
     #[arg(long)]
     url: String,
 }
 
 #[derive(Debug)]
-enum TaskError {
+pub enum TaskError {
     CloneReq,
     Io(IoError),
     Reqwest(ReqwestError),
@@ -79,6 +94,14 @@ impl Error for LinearError {
     }
 }
 
+impl Display for MainError {
+    fn fmt(self: &Self, f: &mut Formatter) -> FmtResult {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl Error for MainError {}
+
 impl Display for TaskError {
     fn fmt(self: &Self, f: &mut Formatter) -> FmtResult {
         write!(f, "{:?}", self)
@@ -97,14 +120,6 @@ impl Error for TaskError {
     }
 }
 
-impl Display for MainError {
-    fn fmt(self: &Self, f: &mut Formatter) -> FmtResult {
-        write!(f, "{:?}", self)
-    }
-}
-
-impl Error for MainError {}
-
 const CHUNK_SIZE: u64 = 16 * 1024 * 1024;
 const RETRY_WAIT_BASE: Duration = Duration::new(0, 100_000_000); // 0.1 seconds
 
@@ -113,18 +128,40 @@ fn build_client() -> Result<Client, ReqwestError> {
 }
 
 #[tokio::main]
-pub async fn try_main<I, T>(itr: I) -> Result<i32, Box<dyn Error>>
+pub async fn try_main<I, T>(itr: I) -> Result<i32, MainError>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
     let opts = Opts::parse_from(itr);
 
+    let mut output = opts.output.clone();
+    if output.is_empty() {
+        output = percent_decode_str(
+            Url::parse(&opts.url)
+                .map_err(MainError::Parse)?
+                .path_segments()
+                .ok_or(MainError::OutputFromUrl)?
+                .filter(|s| !s.is_empty())
+                .last()
+                .ok_or(MainError::OutputFromUrl)?,
+        )
+        .decode_utf8_lossy()
+        .to_string();
+        if output.is_empty() {
+            eprintln!("couldn't calculate output file from url");
+            return Err(MainError::OutputFromUrl);
+        } else {
+            eprintln!("output: {}", output);
+            File::create_new(&output).map_err(|_| MainError::OutputAlreadyExists)?;
+        }
+    }
+
     let (linear_sender, mut linear_receiver) = channel::<LinearJob>(1);
     let mut linear_task = Option::<JoinHandle<Result<(), LinearError>>>::None;
 
     if let Some(linear) = opts.linear {
-        let mut linear_file = File::create(linear)?;
+        let mut linear_file = File::create(linear).map_err(MainError::Io)?;
         linear_task = Some(spawn_blocking(move || {
             let mut next_offset = 0;
             let mut queue = VecDeque::<LinearJob>::new();
@@ -153,15 +190,15 @@ where
 
     let mut pool = VecDeque::<TaskResources>::new();
 
-    let make_resources = || -> Result<TaskResources, ReqwestError> {
+    let make_resources = || -> Result<TaskResources, MainError> {
         Ok(TaskResources {
-            client: build_client()?,
+            client: build_client().map_err(MainError::Reqwest)?,
             linear_sender: if linear_task.is_some() {
                 Some(linear_sender.clone())
             } else {
                 None
             },
-            output: opts.output.clone(),
+            output: output.clone(),
             url: opts.url.clone(),
         })
     };
@@ -173,13 +210,15 @@ where
     let head_resources = make_resources()?;
 
     let req = head_resources.client.head(&head_resources.url);
-    let res = req.send().await?;
+    let res = req.send().await.map_err(MainError::Reqwest)?;
     let content_length = res
         .headers()
         .get(CONTENT_LENGTH)
         .ok_or(MainError::MissingContentLength)?
-        .to_str()?
-        .parse::<u64>()?;
+        .to_str()
+        .map_err(MainError::ToStr)?
+        .parse::<u64>()
+        .map_err(MainError::ParseInt)?;
     eprintln!("content length {}", content_length);
 
     pool.push_back(head_resources);
@@ -192,8 +231,8 @@ where
             Ok::<_, MainError>(r)
         } else {
             if let Some(task_return_join_result) = tasks.join_next().await {
-                let task_return_result = task_return_join_result?;
-                let task_return = task_return_result?;
+                let task_return_result = task_return_join_result.map_err(MainError::Join)?;
+                let task_return = task_return_result.map_err(MainError::Task)?;
                 let r = task_return.resources;
                 Ok(r)
             } else {
@@ -209,7 +248,8 @@ where
             .client
             .get(&resources.url)
             .header(RANGE, range_str.clone())
-            .build()?;
+            .build()
+            .map_err(MainError::Reqwest)?;
         let _ = tasks.spawn(async move {
             // now acquire mmap
             let mut mapping = create_mmap(
@@ -272,13 +312,17 @@ where
     }
 
     while let Some(task_return_join_result) = tasks.join_next().await {
-        task_return_join_result??;
+        task_return_join_result
+            .map_err(MainError::Join)?
+            .map_err(MainError::Task)?;
     }
 
     drop(linear_sender);
 
     if let Some(lt) = linear_task {
-        lt.await??;
+        lt.await
+            .map_err(MainError::Join)?
+            .map_err(MainError::Linear)?;
     }
 
     Ok(0)

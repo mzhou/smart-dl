@@ -7,5 +7,7 @@ version = "0.1.0"
 clap = { features = ["derive"], version = "4.5" }
 generic-array = { version = "1.0" }
 memmap2 = { version = "0.9" }
+percent-encoding = { version = "2.3" }
 reqwest = { version = "0.12" }
 tokio = { features = ["macros", "rt-multi-thread"], version = "1.38" }
+url = { version = "2.5" }

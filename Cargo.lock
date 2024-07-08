@@ -947,8 +947,10 @@ dependencies = [
  "clap",
  "generic-array",
  "memmap2",
+ "percent-encoding",
  "reqwest",
  "tokio",
+ "url",
 ]
 
 [[package]]
