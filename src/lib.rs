@@ -19,7 +19,7 @@ use tokio::sync::mpsc::{channel, Sender};
 use tokio::task::{spawn_blocking, JoinError, JoinHandle, JoinSet};
 use url::{ParseError, Url};
 
-use io_mgr::{create_mmap, MmapMut};
+use io_mgr::{create_anon_mmap, create_mmap, MmapMut};
 
 pub struct LinearJob {
     buf: MmapMut,
@@ -54,10 +54,10 @@ struct Opts {
     connections: usize,
     #[arg(long, required = false)]
     linear: Option<String>,
+    #[arg(long, required = false)]
+    no_output: bool,
     #[arg(default_value = "", long)]
     output: String,
-    #[arg(long)]
-    output_from_url: bool,
     #[arg(long)]
     url: String,
 }
@@ -136,25 +136,29 @@ where
 {
     let opts = Opts::parse_from(itr);
 
-    let mut output = opts.output.clone();
-    if output.is_empty() {
-        output = percent_decode_str(
-            Url::parse(&opts.url)
-                .map_err(MainError::Parse)?
-                .path_segments()
-                .ok_or(MainError::OutputFromUrl)?
-                .filter(|s| !s.is_empty())
-                .last()
-                .ok_or(MainError::OutputFromUrl)?,
-        )
-        .decode_utf8_lossy()
-        .to_string();
+    let mut output = String::new();
+
+    if !opts.no_output {
+        output = opts.output.clone();
         if output.is_empty() {
-            eprintln!("couldn't calculate output file from url");
-            return Err(MainError::OutputFromUrl);
-        } else {
-            eprintln!("output: {}", output);
-            File::create_new(&output).map_err(|_| MainError::OutputAlreadyExists)?;
+            output = percent_decode_str(
+                Url::parse(&opts.url)
+                    .map_err(MainError::Parse)?
+                    .path_segments()
+                    .ok_or(MainError::OutputFromUrl)?
+                    .filter(|s| !s.is_empty())
+                    .last()
+                    .ok_or(MainError::OutputFromUrl)?,
+            )
+            .decode_utf8_lossy()
+            .to_string();
+            if output.is_empty() {
+                eprintln!("couldn't calculate output file from url");
+                return Err(MainError::OutputFromUrl);
+            } else {
+                eprintln!("output: {}", output);
+                File::create_new(&output).map_err(|_| MainError::OutputAlreadyExists)?;
+            }
         }
     }
 
@@ -253,12 +257,16 @@ where
             .map_err(MainError::Reqwest)?;
         let _ = tasks.spawn(async move {
             // now acquire mmap
-            let mut mapping = create_mmap(
-                &resources.output,
-                content_length,
-                range_begin,
-                range_size as usize,
-            )
+            let mut mapping = if resources.output.is_empty() {
+                create_anon_mmap(range_size as usize)
+            } else {
+                create_mmap(
+                    &resources.output,
+                    content_length,
+                    range_begin,
+                    range_size as usize,
+                )
+            }
             .map_err(TaskError::Io)?;
             let mut retry = 0;
             loop {

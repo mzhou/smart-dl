@@ -28,3 +28,10 @@ pub fn create_mmap<P: AsRef<Path>>(
     //eprintln!("create_mmap({}, {}, {}, {}) ok", path.as_ref().display(), fsize, offset, len);
     Ok(m)
 }
+
+pub fn create_anon_mmap(len: usize) -> IoResult<MmapMut> {
+    let mut opts = MmapOptions::new();
+    opts.len(len);
+    let m = opts.map_anon()?;
+    Ok(m)
+}

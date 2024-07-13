@@ -8,6 +8,6 @@ clap = { features = ["derive"], version = "4.5" }
 generic-array = { version = "1.0" }
 memmap2 = { version = "0.9" }
 percent-encoding = { version = "2.3" }
-reqwest = { version = "0.12" }
+reqwest = { default-features = false, features = ["charset", "http2", "macos-system-configuration", "rustls-tls-native-roots"], version = "0.12" }
 tokio = { features = ["macros", "rt-multi-thread"], version = "1.38" }
 url = { version = "2.5" }
