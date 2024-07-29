@@ -1,6 +1,6 @@
 mod io_mgr;
 
-use std::cmp::min;
+use std::cmp::{max, min};
 use std::collections::VecDeque;
 use std::error::Error;
 use std::ffi::OsString;
@@ -8,15 +8,23 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::fs::File;
 use std::io::{Error as IoError, Write};
 use std::num::ParseIntError;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use percent_encoding::percent_decode_str;
 use reqwest::header::{ToStrError, CONTENT_LENGTH, RANGE};
 use reqwest::{Client, Error as ReqwestError};
+use tokio::select;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{channel, Sender};
-use tokio::task::{spawn_blocking, JoinError, JoinHandle, JoinSet};
+use tokio::sync::watch::error::SendError as WatchSendError;
+use tokio::sync::watch::{
+    channel as watch_channel, Receiver as WatchReceiver, Sender as WatchSender,
+};
+use tokio::task::{spawn, spawn_blocking, JoinError, JoinHandle, JoinSet};
+use tokio::time::sleep;
 use url::{ParseError, Url};
 
 use io_mgr::{create_anon_mmap, create_mmap, MmapMut};
@@ -67,6 +75,7 @@ pub enum TaskError {
     CloneReq,
     Io(IoError),
     Reqwest(ReqwestError),
+    SendProgress(WatchSendError<Option<TaskProgress>>),
     Send(SendError<LinearJob>),
 }
 
@@ -74,10 +83,17 @@ struct TaskReturn {
     resources: TaskResources,
 }
 
+pub struct TaskProgress {
+    bytes_received: usize,
+    end: Instant,
+    start: Instant,
+}
+
 struct TaskResources {
     client: Client,
     linear_sender: Option<Sender<LinearJob>>,
     output: String,
+    progress_sender: WatchSender<Option<TaskProgress>>,
     url: String,
 }
 
@@ -117,6 +133,7 @@ impl Error for TaskError {
             CloneReq => None,
             Io(e) => e.source(),
             Reqwest(e) => e.source(),
+            SendProgress(e) => e.source(),
             Send(e) => e.source(),
         }
     }
@@ -194,18 +211,32 @@ where
     }
 
     let mut pool = VecDeque::<TaskResources>::new();
+    let progress_receivers = Arc::new(RwLock::new(
+        VecDeque::<WatchReceiver<Option<TaskProgress>>>::new(),
+    ));
 
-    let make_resources = || -> Result<TaskResources, MainError> {
-        Ok(TaskResources {
-            client: build_client().map_err(MainError::Reqwest)?,
-            linear_sender: if linear_task.is_some() {
-                Some(linear_sender.clone())
-            } else {
-                None
-            },
-            output: output.clone(),
-            url: opts.url.clone(),
-        })
+    let make_resources = {
+        let progress_receivers = progress_receivers.clone();
+        let linear_enabled = linear_task.is_some();
+        move || -> Result<TaskResources, MainError> {
+            let (progress_sender, progress_receiver) = watch_channel(None);
+            progress_receivers
+                .write()
+                .unwrap()
+                .push_back(progress_receiver);
+
+            Ok(TaskResources {
+                client: build_client().map_err(MainError::Reqwest)?,
+                linear_sender: if linear_enabled {
+                    Some(linear_sender.clone())
+                } else {
+                    None
+                },
+                output: output.clone(),
+                progress_sender,
+                url: opts.url.clone(),
+            })
+        }
     };
 
     for _ in 0..opts.connections.saturating_sub(1) {
@@ -227,6 +258,48 @@ where
     eprintln!("content length {}", content_length);
 
     pool.push_back(head_resources);
+
+    let progress_cancel = Arc::new(AtomicBool::new(false));
+    let progress_print_task = spawn({
+        let progress_cancel = progress_cancel.clone();
+        async move {
+            loop {
+                if progress_cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                sleep(Duration::from_secs(1)).await;
+                let now = Instant::now();
+                let mut active_conns = 0;
+                let total_rate: u64 = progress_receivers
+                    .write()
+                    .unwrap()
+                    .iter_mut()
+                    .map(|pr| {
+                        let Some(progress) = &*pr.borrow_and_update() else {
+                            return 0u64;
+                        };
+                        // assume 0 from tasks that haven't received for more than 1 second
+                        if now.duration_since(progress.end) > Duration::from_secs(1) {
+                            return 0u64;
+                        }
+                        active_conns += 1;
+                        // otherwise assume same speed over last read
+                        (progress.bytes_received as u64)
+                            / max(
+                                progress.end.duration_since(progress.start).as_millis() as u64,
+                                1,
+                            )
+                    })
+                    .sum();
+                if total_rate > 0 {
+                    eprintln!(
+                        "Speed: {} KB/s. {} connections received data in last second.",
+                        total_rate, active_conns
+                    );
+                }
+            }
+        }
+    });
 
     let file_chunks = (content_length + opts.chunk_size - 1) / opts.chunk_size;
     eprintln!("{} chunks", file_chunks);
@@ -270,13 +343,14 @@ where
             .map_err(TaskError::Io)?;
             let mut retry = 0;
             loop {
+                let mut progress_start = Instant::now();
                 // send request and wait for response
                 let res_result = resources
                     .client
                     .execute(req.try_clone().ok_or(TaskError::CloneReq)?)
                     .await;
                 match res_result {
-                    Ok(res) => {
+                    Ok(mut res) => {
                         if res.status() != 206 {
                             let delay = RETRY_WAIT_BASE * 2u32.pow(retry);
                             eprintln!(
@@ -291,8 +365,51 @@ where
                             retry += 1;
                             continue;
                         }
-                        let bytes = res.bytes().await.map_err(TaskError::Reqwest)?;
-                        mapping.copy_from_slice(bytes.as_ref());
+                        let mut bytes_received = 0usize;
+                        while let Some(chunk) = res.chunk().await.map_err(TaskError::Reqwest)? {
+                            let mut burst_bytes_received = 0;
+                            let mut progress_end = Instant::now();
+                            mapping[bytes_received + burst_bytes_received..bytes_received + burst_bytes_received + chunk.len()]
+                                .copy_from_slice(chunk.as_ref());
+                            burst_bytes_received += chunk.len();
+
+                            // also grab any further chunks that are immediately available
+                            let mut got_none_chunk = false;
+                            loop {
+                                select! {
+                                    biased;
+                                    chunk_opt = res.chunk() => {
+                                        if let Some(chunk) = chunk_opt.map_err(TaskError::Reqwest)? {
+                                            progress_end = Instant::now();
+                                            mapping[bytes_received + burst_bytes_received..bytes_received + burst_bytes_received + chunk.len()]
+                                                .copy_from_slice(chunk.as_ref());
+                                            burst_bytes_received += chunk.len();
+                                        } else {
+                                            got_none_chunk = true;
+                                            break;
+                                        }
+                                    },
+                                    else => break,
+                                }
+                            }
+
+                            let progress = TaskProgress {
+                                end: progress_end,
+                                bytes_received: burst_bytes_received,
+                                start: progress_start,
+                            };
+                            resources
+                                .progress_sender
+                                .send(Some(progress))
+                                .map_err(TaskError::SendProgress)?;
+                            bytes_received += burst_bytes_received;
+
+                            if got_none_chunk {
+                                break;
+                            }
+
+                            progress_start = Instant::now();
+                        }
                         mapping.flush_async().map_err(TaskError::Io)?;
                         break;
                     }
@@ -320,19 +437,37 @@ where
         });
     }
 
+    eprintln!("all dl tasks created");
+
+    // clean up linear_sender clones
+    drop(make_resources);
+    drop(pool);
+
+    eprintln!("resources cleaned up");
+
     while let Some(task_return_join_result) = tasks.join_next().await {
         task_return_join_result
             .map_err(MainError::Join)?
             .map_err(MainError::Task)?;
     }
 
-    drop(linear_sender);
+    eprintln!("all dl tasks done");
 
     if let Some(lt) = linear_task {
+        eprintln!("linear task wait");
         lt.await
             .map_err(MainError::Join)?
             .map_err(MainError::Linear)?;
+        eprintln!("linear task done");
     }
+
+    progress_cancel.store(true, Ordering::Relaxed);
+
+    eprintln!("progress cancel requested");
+
+    progress_print_task.await.map_err(MainError::Join)?;
+
+    eprintln!("ok");
 
     Ok(0)
 }
