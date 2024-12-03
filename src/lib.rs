@@ -270,11 +270,13 @@ where
                 sleep(Duration::from_secs(1)).await;
                 let now = Instant::now();
                 let mut active_conns = 0;
+                let mut total_conns = 0;
                 let total_rate: u64 = progress_receivers
                     .write()
                     .unwrap()
                     .iter_mut()
                     .map(|pr| {
+                        total_conns += 1;
                         let Some(progress) = &*pr.borrow_and_update() else {
                             return 0u64;
                         };
@@ -293,8 +295,8 @@ where
                     .sum();
                 if total_rate > 0 {
                     eprintln!(
-                        "Speed: {} KB/s. {} connections received data in last second.",
-                        total_rate, active_conns
+                        "Speed: {} KB/s. {}/{} connections received data in last second.",
+                        total_rate, active_conns, total_conns
                     );
                 }
             }
@@ -373,6 +375,16 @@ where
                                 .copy_from_slice(chunk.as_ref());
                             burst_bytes_received += chunk.len();
 
+                            let progress = TaskProgress {
+                                end: progress_end,
+                                bytes_received: burst_bytes_received,
+                                start: progress_start,
+                            };
+                            resources
+                                .progress_sender
+                                .send(Some(progress))
+                                .map_err(TaskError::SendProgress)?;
+
                             // also grab any further chunks that are immediately available
                             let mut got_none_chunk = false;
                             loop {
@@ -384,6 +396,16 @@ where
                                             mapping[bytes_received + burst_bytes_received..bytes_received + burst_bytes_received + chunk.len()]
                                                 .copy_from_slice(chunk.as_ref());
                                             burst_bytes_received += chunk.len();
+
+                                            let progress = TaskProgress {
+                                                end: progress_end,
+                                                bytes_received: burst_bytes_received,
+                                                start: progress_start,
+                                            };
+                                            resources
+                                                .progress_sender
+                                                .send(Some(progress))
+                                                .map_err(TaskError::SendProgress)?;
                                         } else {
                                             got_none_chunk = true;
                                             break;
@@ -393,15 +415,6 @@ where
                                 }
                             }
 
-                            let progress = TaskProgress {
-                                end: progress_end,
-                                bytes_received: burst_bytes_received,
-                                start: progress_start,
-                            };
-                            resources
-                                .progress_sender
-                                .send(Some(progress))
-                                .map_err(TaskError::SendProgress)?;
                             bytes_received += burst_bytes_received;
 
                             if got_none_chunk {
