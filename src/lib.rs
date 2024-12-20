@@ -188,6 +188,7 @@ where
             let mut next_offset = 0;
             let mut queue = VecDeque::<LinearJob>::new();
             while let Some(job) = linear_receiver.blocking_recv() {
+                let initial_offset = next_offset;
                 if job.offset == next_offset {
                     linear_file.write_all(&job.buf).map_err(LinearError::Io)?;
                     next_offset += job.buf.len();
@@ -204,6 +205,13 @@ where
                         .write_all(&queued_job.buf)
                         .map_err(LinearError::Io)?;
                     next_offset += queued_job.buf.len();
+                }
+                if next_offset != initial_offset {
+                    eprintln!(
+                        "Linear wrote {} bytes at {}",
+                        next_offset - initial_offset,
+                        initial_offset
+                    );
                 }
             }
             Ok::<_, LinearError>(())
@@ -344,7 +352,8 @@ where
             }
             .map_err(TaskError::Io)?;
             let mut retry = 0;
-            loop {
+            'retry: loop {
+                let delay = RETRY_WAIT_BASE * 2u32.pow(retry);
                 let mut progress_start = Instant::now();
                 // send request and wait for response
                 let res_result = resources
@@ -354,7 +363,6 @@ where
                 match res_result {
                     Ok(mut res) => {
                         if res.status() != 206 {
-                            let delay = RETRY_WAIT_BASE * 2u32.pow(retry);
                             eprintln!(
                                 "Error downloading chunk {} ({}) (retry {}) wait {:?}: {}",
                                 chunk_i,
@@ -368,7 +376,27 @@ where
                             continue;
                         }
                         let mut bytes_received = 0usize;
-                        while let Some(chunk) = res.chunk().await.map_err(TaskError::Reqwest)? {
+                        loop {
+                            let chunk_res = res.chunk().await;
+                            let chunk_opt = match chunk_res {
+                                Err(chunk_err) => {
+                                    eprintln!(
+                                        "Error downloading chunk {} ({}) (retry {}) wait {:?}: {:?}",
+                                        chunk_i,
+                                        &range_str,
+                                        retry,
+                                        &delay,
+                                        chunk_err
+                                    );
+                                    tokio::time::sleep(delay).await;
+                                    retry += 1;
+                                    continue 'retry;
+                                },
+                                Ok(co) => co,
+                            };
+                            let Some(chunk) = chunk_opt else {
+                                break;
+                            };
                             let mut burst_bytes_received = 0;
                             let mut progress_end = Instant::now();
                             mapping[bytes_received + burst_bytes_received..bytes_received + burst_bytes_received + chunk.len()]
@@ -390,26 +418,41 @@ where
                             loop {
                                 select! {
                                     biased;
-                                    chunk_opt = res.chunk() => {
-                                        if let Some(chunk) = chunk_opt.map_err(TaskError::Reqwest)? {
-                                            progress_end = Instant::now();
-                                            mapping[bytes_received + burst_bytes_received..bytes_received + burst_bytes_received + chunk.len()]
-                                                .copy_from_slice(chunk.as_ref());
-                                            burst_bytes_received += chunk.len();
-
-                                            let progress = TaskProgress {
-                                                end: progress_end,
-                                                bytes_received: burst_bytes_received,
-                                                start: progress_start,
-                                            };
-                                            resources
-                                                .progress_sender
-                                                .send(Some(progress))
-                                                .map_err(TaskError::SendProgress)?;
-                                        } else {
+                                    chunk_res = res.chunk() => {
+                                        let chunk_opt = match chunk_res {
+                                            Err(chunk_err) => {
+                                                eprintln!(
+                                                    "Error downloading chunk {} ({}) (retry {}) wait {:?}: {:?}",
+                                                    chunk_i,
+                                                    &range_str,
+                                                    retry,
+                                                    &delay,
+                                                    chunk_err
+                                                );
+                                                tokio::time::sleep(delay).await;
+                                                retry += 1;
+                                                continue 'retry;
+                                            },
+                                            Ok(co) => co,
+                                        };
+                                        let Some(chunk) = chunk_opt else {
                                             got_none_chunk = true;
                                             break;
-                                        }
+                                        };
+                                        progress_end = Instant::now();
+                                        mapping[bytes_received + burst_bytes_received..bytes_received + burst_bytes_received + chunk.len()]
+                                            .copy_from_slice(chunk.as_ref());
+                                        burst_bytes_received += chunk.len();
+
+                                        let progress = TaskProgress {
+                                            end: progress_end,
+                                            bytes_received: burst_bytes_received,
+                                            start: progress_start,
+                                        };
+                                        resources
+                                            .progress_sender
+                                            .send(Some(progress))
+                                            .map_err(TaskError::SendProgress)?;
                                     },
                                     else => break,
                                 }
@@ -424,10 +467,15 @@ where
                             progress_start = Instant::now();
                         }
                         mapping.flush_async().map_err(TaskError::Io)?;
+                        eprintln!(
+                            "Finished downloading chunk {} ({}) (retry {})",
+                            chunk_i,
+                            &range_str,
+                            retry,
+                        );
                         break;
                     }
                     Err(e) => {
-                        let delay = RETRY_WAIT_BASE * 2u32.pow(retry);
                         eprintln!(
                             "Error downloading chunk {} ({}) (retry {}) wait {:?}: {:?}",
                             chunk_i, &range_str, retry, &delay, e
